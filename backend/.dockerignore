@@ -1,0 +1,13 @@
+# Only package manifests, prisma/ and src/ are copied; keep the build context small.
+node_modules
+dist
+coverage
+src/generated
+test
+.env
+.env.*
+!.env.example
+*.log
+.git
+.vscode
+.idea

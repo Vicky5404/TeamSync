@@ -1,0 +1,209 @@
+# FlowSync CI
+#
+# Pull requests: install → format/lint → typecheck → unit tests → build (backend + frontend),
+#                plus database validation and API integration tests against real services.
+# main:          the same checks, then production Docker images are built and smoke-tested
+#                with docker compose.
+#
+# Nothing is deployed. Images are only pushed to GHCR when the repository variable
+# PUSH_IMAGES is set to "true"; deployments need their own, explicitly configured workflow
+# (see docs/deployment.md).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  backend:
+    name: Backend · lint, typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Format
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test:cov
+      - name: Build
+        run: npm run build
+
+  backend-integration:
+    name: Backend · database validation + integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgresql://flowsync:flowsync@localhost:5432/flowsync?schema=public
+      SHADOW_DATABASE_URL: postgresql://flowsync:flowsync@localhost:5432/flowsync_shadow?schema=public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Start PostgreSQL, Redis and S3
+        working-directory: .
+        run: docker compose up -d --wait postgres redis s3
+      - name: Validate schema
+        run: npx prisma validate
+      - name: Apply migrations to an empty database
+        run: npx prisma migrate deploy
+      - name: Check migrations and schema agree (no drift)
+        run: |
+          docker compose -f ../docker-compose.yml exec -T postgres createdb -U flowsync flowsync_shadow
+          npx prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --exit-code
+          npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+      - name: Seed (idempotent)
+        run: npm run db:seed && npm run db:seed
+      - name: Integration tests
+        run: npm run test:integration
+      - name: Service logs
+        if: failure()
+        working-directory: .
+        run: docker compose logs --no-color postgres redis s3
+
+  frontend:
+    name: Frontend · lint, typecheck, tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Format
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests
+        run: npm run test:cov
+      - name: Build
+        run: npm run build
+      - name: Bundle size report
+        run: du -ah dist/assets | sort -h | tail -15 >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    name: Docker images · build + smoke test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend, backend-integration, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: ${{ vars.PUSH_IMAGES == 'true' }}
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each image is also tagged with the name docker-compose.yml uses, so the smoke
+      # test below runs exactly these builds.
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: api
+          build-args: APP_VERSION=${{ github.sha }}
+          load: true
+          tags: flowsync-api:local,${{ env.REGISTRY }}/flowsync-api:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: worker
+          build-args: APP_VERSION=${{ github.sha }}
+          load: true
+          tags: flowsync-worker:local,${{ env.REGISTRY }}/flowsync-worker:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+      - name: Build migration image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: migrate
+          load: true
+          tags: flowsync-migrate:local,${{ env.REGISTRY }}/flowsync-migrate:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          build-args: APP_VERSION=${{ github.sha }}
+          load: true
+          tags: flowsync-web:local,${{ env.REGISTRY }}/flowsync-web:${{ github.sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Smoke test the full stack
+        run: |
+          docker compose up -d --no-build --wait --wait-timeout 180
+          curl -fsS http://localhost:8080/healthz
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8080/api/v1/auth/me)" = 401
+          curl -fsS http://localhost:4000/health | grep -q '"status":"ok"'
+          curl -fsSI http://localhost:8080/ | grep -qi 'content-security-policy'
+      - name: Stack logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
+      - name: Push images
+        if: env.PUSH == 'true'
+        run: |
+          for image in flowsync-api flowsync-worker flowsync-migrate flowsync-web; do
+            docker push "$REGISTRY/$image:${{ github.sha }}"
+          done

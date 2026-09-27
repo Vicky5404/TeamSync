@@ -1,0 +1,17 @@
+# Package-specific rules live in backend/.gitignore and frontend/.gitignore.
+
+# Local docker compose overrides (may contain secrets)
+.env
+.env.*
+!.env.example
+# Public Vite defaults (VITE_ values only, no secrets); local overrides stay ignored
+# via frontend/.gitignore (.env.local, .env.*.local).
+!frontend/.env.development
+!frontend/.env.production
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json

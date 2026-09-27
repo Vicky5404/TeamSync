@@ -1,0 +1,5 @@
+# Keep LF in the working tree on every OS: Prettier's format:check expects LF, and
+# Dockerfiles / nginx templates are consumed inside Linux containers.
+* text=auto eol=lf
+
+*.png binary

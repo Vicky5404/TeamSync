@@ -1,0 +1,598 @@
+// FlowSync database schema (PostgreSQL). See docs/database.md for the ER
+// diagram and the reasoning behind constraints, indexes and soft deletes.
+//
+// Conventions:
+// - Primary keys are time-ordered UUIDv7 (good index locality, safe to expose).
+// - Tables and columns are snake_case in the database, camelCase in the client.
+// - `organizationId` is denormalized onto tasks, attachments, activity, task
+//   labels and project members so organization-scoped queries never need joins.
+// - Tenant integrity is enforced by the database, not just the application:
+//   child rows reference their parent through composite (id, organization_id)
+//   foreign keys, so a row can never point at another organization's data.
+// - Projects, tasks, comments and users are soft-deleted (`deleted_at`); list
+//   indexes are partial (`WHERE deleted_at IS NULL`). A maintenance job purges
+//   soft-deleted rows after the retention window.
+// - CHECK constraints and the audit-log immutability trigger live in the
+//   migrations (Prisma does not model them, and never drops them).
+// - Calendar dates (due/start dates) use DATE; instants use TIMESTAMPTZ.
+// - Binary file contents never live here — only object-storage metadata.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/generated/prisma"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+  previewFeatures        = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  OWNER
+  ADMIN
+  MANAGER
+  MEMBER
+  VIEWER
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskStatus {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  REVIEW
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum LabelColor {
+  gray
+  red
+  orange
+  amber
+  green
+  teal
+  blue
+  indigo
+  violet
+  pink
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_COMMENTED
+  MENTIONED
+  TASK_DUE_SOON
+  TASK_STATUS_CHANGED
+  PROJECT_ADDED
+  MEMBER_JOINED
+}
+
+enum UserTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum AttachmentStatus {
+  PENDING
+  READY
+}
+
+enum ReportType {
+  TASK_EXPORT
+  PROJECT_SUMMARY
+}
+
+enum ReportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id                      String    @id @default(uuid(7)) @db.Uuid
+  /// Always stored lower-cased.
+  email                   String    @unique @db.VarChar(254)
+  name                    String    @db.VarChar(80)
+  passwordHash            String    @map("password_hash")
+  jobTitle                String?   @map("job_title") @db.VarChar(100)
+  timezone                String    @default("UTC") @db.VarChar(64)
+  /// Object-storage key of the avatar image (internal).
+  avatarKey               String?   @map("avatar_key")
+  /// Public, cache-friendly avatar URL served by the API.
+  avatarUrl               String?   @map("avatar_url")
+  emailVerifiedAt         DateTime? @map("email_verified_at") @db.Timestamptz(3)
+  passwordChangedAt       DateTime? @map("password_changed_at") @db.Timestamptz(3)
+  /// Per-type channel preferences; null means "use defaults".
+  notificationPreferences Json?     @map("notification_preferences")
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  /// Account deleted by its owner. The row is kept (anonymized) so authorship
+  /// of comments, tasks and history stays intact; the email is tombstoned so
+  /// the address can register again.
+  deletedAt               DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  sessions             Session[]
+  tokens               UserToken[]
+  memberships          Membership[]
+  invitationsSent      Invitation[]     @relation("InvitationInviter")
+  ownedProjects        Project[]        @relation("ProjectOwner")
+  projectMemberships   ProjectMember[]
+  assignedTasks        Task[]           @relation("TaskAssignee")
+  reportedTasks        Task[]           @relation("TaskReporter")
+  comments             Comment[]
+  mentions             CommentMention[]
+  attachments          Attachment[]
+  activities           Activity[]
+  notifications        Notification[]   @relation("NotificationRecipient")
+  notificationsCreated Notification[]   @relation("NotificationActor")
+  reports              Report[]
+  auditLogs            AuditLog[]       @relation("AuditLogActor")
+
+  @@map("users")
+}
+
+/// A signed-in device. The refresh token itself is never stored — only its SHA-256 hash.
+model Session {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  refreshTokenHash  String    @unique @map("refresh_token_hash")
+  /// Hash of the token that was rotated out; used for reuse detection.
+  previousTokenHash String?   @map("previous_token_hash")
+  rotatedAt         DateTime? @map("rotated_at") @db.Timestamptz(3)
+  rememberMe        Boolean   @default(false) @map("remember_me")
+  userAgent         String?   @map("user_agent") @db.VarChar(512)
+  ipAddress         String?   @map("ip_address") @db.VarChar(64)
+  device            String    @default("Desktop") @db.VarChar(32)
+  browser           String    @default("Browser") @db.VarChar(64)
+  os                String    @default("Unknown OS") @db.VarChar(64)
+  location          String?   @db.VarChar(128)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastActiveAt      DateTime  @default(now()) @map("last_active_at") @db.Timestamptz(3)
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([previousTokenHash])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Single-use tokens for email verification and password reset (hashed).
+model UserToken {
+  id         String        @id @default(uuid(7)) @db.Uuid
+  userId     String        @map("user_id") @db.Uuid
+  type       UserTokenType
+  tokenHash  String        @unique @map("token_hash")
+  expiresAt  DateTime      @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime?     @map("consumed_at") @db.Timestamptz(3)
+  createdAt  DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@map("user_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  name        String   @db.VarChar(64)
+  slug        String   @unique @db.VarChar(48)
+  description String?  @db.VarChar(500)
+  logoUrl     String?  @map("logo_url")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  memberships   Membership[]
+  invitations   Invitation[]
+  labels        Label[]
+  projects      Project[]
+  tasks         Task[]
+  attachments   Attachment[]
+  activities    Activity[]
+  notifications Notification[]
+  reports       Report[]
+  auditLogs     AuditLog[]
+
+  @@map("organizations")
+}
+
+/// Organization membership ("OrganizationMember"): one row per user per organization.
+model Membership {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  role           Role
+  joinedAt       DateTime  @default(now()) @map("joined_at") @db.Timestamptz(3)
+  lastActiveAt   DateTime? @map("last_active_at") @db.Timestamptz(3)
+
+  organization       Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Project memberships require an organization membership (removed with it).
+  projectMemberships ProjectMember[]
+  /// Tasks may only be assigned to members; unassign before removing a member.
+  assignedTasks      Task[]          @relation("TaskAssigneeMembership")
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+/// Pending invitation. At most one per organization and email address; it is
+/// deleted when accepted, revoked or (after a grace period) expired.
+model Invitation {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  /// Always stored lower-cased.
+  email          String   @db.VarChar(254)
+  role           Role
+  tokenHash      String   @unique @map("token_hash")
+  message        String?  @db.VarChar(500)
+  invitedById    String?  @map("invited_by_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt      DateTime @map("expires_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User?        @relation("InvitationInviter", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, email])
+  @@index([email])
+  @@index([expiresAt])
+  @@map("invitations")
+}
+
+model Label {
+  id             String     @id @default(uuid(7)) @db.Uuid
+  organizationId String     @map("organization_id") @db.Uuid
+  name           String     @db.VarChar(32)
+  color          LabelColor
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks        TaskLabel[]
+
+  @@unique([organizationId, name])
+  // Target of the tenant-safe composite foreign key from task_labels.
+  @@unique([id, organizationId])
+  @@map("labels")
+}
+
+// ---------------------------------------------------------------------------
+// Projects & tasks
+// ---------------------------------------------------------------------------
+
+model Project {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  /// Short uppercase key used for task identifiers, e.g. WEB → WEB-42.
+  key            String        @db.VarChar(6)
+  name           String        @db.VarChar(80)
+  description    String?       @db.VarChar(2000)
+  status         ProjectStatus @default(PLANNING)
+  ownerId        String?       @map("owner_id") @db.Uuid
+  startDate      DateTime?     @map("start_date") @db.Date
+  dueDate        DateTime?     @map("due_date") @db.Date
+  /// Last task number issued in this project (atomically incremented).
+  taskSequence   Int           @default(0) @map("task_sequence")
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  /// In the trash. Its tasks are soft-deleted with the same timestamp so they
+  /// can be restored together; purged for good after the retention window.
+  deletedAt      DateTime?     @map("deleted_at") @db.Timestamptz(3)
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner        User?           @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  members      ProjectMember[]
+  tasks        Task[]
+  activities   Activity[]
+
+  // Keys are unique among live projects; a deleted project releases its key.
+  @@unique([organizationId, key], where: raw("deleted_at IS NULL"))
+  // Target of the tenant-safe composite foreign keys from tasks, members and activity.
+  @@unique([id, organizationId])
+  @@index([organizationId, status], where: raw("deleted_at IS NULL"))
+  @@index([organizationId, updatedAt], where: raw("deleted_at IS NULL"))
+  @@index([deletedAt], where: raw("deleted_at IS NOT NULL"))
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "projects_name_trgm_idx")
+  @@map("projects")
+}
+
+model ProjectMember {
+  projectId      String   @map("project_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  /// Copied from the project; lets the database require an organization membership.
+  organizationId String   @map("organization_id") @db.Uuid
+  addedAt        DateTime @default(now()) @map("added_at") @db.Timestamptz(3)
+
+  project    Project    @relation(fields: [projectId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  membership Membership @relation(fields: [organizationId, userId], references: [organizationId, userId], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@index([userId, organizationId])
+  @@map("project_members")
+}
+
+model Task {
+  id             String       @id @default(uuid(7)) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  projectId      String       @map("project_id") @db.Uuid
+  /// Sequential per project; combined with the project key to form the identifier.
+  number         Int
+  title          String       @db.VarChar(200)
+  description    String?
+  status         TaskStatus   @default(TODO)
+  priority       TaskPriority @default(MEDIUM)
+  /// Fractional ordering key within a status column (ascending).
+  position       Float
+  assigneeId     String?      @map("assignee_id") @db.Uuid
+  reporterId     String?      @map("reporter_id") @db.Uuid
+  dueDate        DateTime?    @map("due_date") @db.Date
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  /// Set exactly when status is DONE (CHECK constraint).
+  completedAt    DateTime?    @map("completed_at") @db.Timestamptz(3)
+  /// In the trash (individually, or with its project); purged after the retention window.
+  deletedAt      DateTime?    @map("deleted_at") @db.Timestamptz(3)
+
+  organization       Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// Composite key: a task always belongs to a project of its own organization.
+  project            Project         @relation(fields: [projectId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  assignee           User?           @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  /// The assignee must be a member of the task's organization.
+  assigneeMembership Membership?     @relation("TaskAssigneeMembership", fields: [organizationId, assigneeId], references: [organizationId, userId], onDelete: NoAction, onUpdate: NoAction)
+  reporter           User?           @relation("TaskReporter", fields: [reporterId], references: [id], onDelete: SetNull)
+  labels             TaskLabel[]
+  checklistItems     ChecklistItem[]
+  comments           Comment[]
+  attachments        Attachment[]
+  activities         Activity[]
+
+  @@unique([projectId, number])
+  // Target of the tenant-safe composite foreign keys from attachments and task labels.
+  @@unique([id, organizationId])
+  // Kanban board: one column in position order (also next-position lookups).
+  @@index([projectId, status, position], where: raw("deleted_at IS NULL"))
+  // Organization-wide task list, default sort.
+  @@index([organizationId, updatedAt(sort: Desc), id(sort: Desc)], where: raw("deleted_at IS NULL"))
+  @@index([organizationId, status], where: raw("deleted_at IS NULL"))
+  // Not partial: also serves the membership foreign key checks and unassignment on member removal.
+  @@index([organizationId, assigneeId, status])
+  @@index([organizationId, dueDate], where: raw("deleted_at IS NULL"))
+  @@index([organizationId, completedAt], where: raw("deleted_at IS NULL"))
+  @@index([organizationId, createdAt], where: raw("deleted_at IS NULL"))
+  // Hourly cross-organization due-date reminder scan.
+  @@index([dueDate], map: "tasks_due_soon_idx", where: raw("((deleted_at IS NULL) AND (assignee_id IS NOT NULL) AND (status <> 'DONE'::\"TaskStatus\"))"))
+  @@index([deletedAt], where: raw("deleted_at IS NOT NULL"))
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "tasks_title_trgm_idx")
+  @@map("tasks")
+}
+
+model TaskLabel {
+  taskId         String @map("task_id") @db.Uuid
+  labelId        String @map("label_id") @db.Uuid
+  /// Copied from the task; guarantees task and label belong to the same organization.
+  organizationId String @map("organization_id") @db.Uuid
+
+  task  Task  @relation(fields: [taskId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  label Label @relation(fields: [labelId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([taskId, labelId])
+  @@index([labelId])
+  @@map("task_labels")
+}
+
+model ChecklistItem {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  taskId    String   @map("task_id") @db.Uuid
+  title     String   @db.VarChar(200)
+  completed Boolean  @default(false)
+  position  Float
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, position])
+  @@map("checklist_items")
+}
+
+// ---------------------------------------------------------------------------
+// Collaboration
+// ---------------------------------------------------------------------------
+
+/// Belongs to its organization through the task.
+model Comment {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  taskId    String    @map("task_id") @db.Uuid
+  authorId  String?   @map("author_id") @db.Uuid
+  body      String
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  editedAt  DateTime? @map("edited_at") @db.Timestamptz(3)
+  /// Deleted by its author or a moderator; kept for the retention window, then purged.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  task     Task             @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author   User?            @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  mentions CommentMention[]
+
+  // Not partial: also serves the cascade from tasks.
+  @@index([taskId, createdAt])
+  @@index([deletedAt], where: raw("deleted_at IS NOT NULL"))
+  @@map("comments")
+}
+
+model CommentMention {
+  commentId String @map("comment_id") @db.Uuid
+  userId    String @map("user_id") @db.Uuid
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId])
+  @@map("comment_mentions")
+}
+
+/// Metadata for a file stored in object storage (the bytes live in S3).
+model Attachment {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  taskId         String           @map("task_id") @db.Uuid
+  uploadedById   String?          @map("uploaded_by_id") @db.Uuid
+  fileName       String           @map("file_name") @db.VarChar(255)
+  mimeType       String           @map("mime_type") @db.VarChar(127)
+  /// Size in bytes.
+  size           Int
+  storageKey     String           @unique @map("storage_key") @db.VarChar(512)
+  status         AttachmentStatus @default(PENDING)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  uploadedAt     DateTime?        @map("uploaded_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// Composite key: an attachment always belongs to a task of its own organization.
+  task         Task         @relation(fields: [taskId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  uploadedBy   User?        @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([taskId, status, createdAt])
+  @@index([status, createdAt])
+  @@map("attachments")
+}
+
+/// Append-only activity log ("ActivityLog"): the collaboration feed shown in
+/// the product. Security and administrative events go to `AuditLog`.
+model Activity {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  projectId      String?  @map("project_id") @db.Uuid
+  taskId         String?  @map("task_id") @db.Uuid
+  actorId        String?  @map("actor_id") @db.Uuid
+  /// Dotted action name, e.g. `task.status_changed`.
+  action         String   @db.VarChar(64)
+  /// Snapshot of the target at the time of the action ({ type, id, name, … }).
+  target         Json
+  /// Action-specific details, e.g. { from: "TODO", to: "DONE" }.
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// Composite key: activity can only reference a project of its own organization.
+  project      Project?     @relation(fields: [projectId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  task         Task?        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  actor        User?        @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([organizationId, actorId, createdAt(sort: Desc)])
+  @@index([projectId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([taskId, createdAt(sort: Desc)])
+  @@map("activities")
+}
+
+/// Immutable security/administration trail (role changes, removals,
+/// invitations, deletions, password changes …). A trigger rejects UPDATEs;
+/// rows are only ever inserted, or deleted by retention/tenant deletion.
+/// `organizationId` is null for account-level and platform events.
+model AuditLog {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String?  @map("organization_id") @db.Uuid
+  actorId        String?  @map("actor_id") @db.Uuid
+  /// Dotted action name, e.g. `member.role_changed`.
+  action         String   @db.VarChar(64)
+  /// Kind of entity acted on, e.g. `member`, `project`, `user`.
+  entityType     String   @map("entity_type") @db.VarChar(32)
+  entityId       String?  @map("entity_id") @db.Uuid
+  /// Action-specific details (before/after values, emails, names …).
+  metadata       Json     @default("{}")
+  ipAddress      String?  @map("ip_address") @db.VarChar(64)
+  userAgent      String?  @map("user_agent") @db.VarChar(512)
+  requestId      String?  @map("request_id") @db.VarChar(128)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor        User?         @relation("AuditLogActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([actorId, createdAt(sort: Desc)])
+  // Retention purge.
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  userId         String           @map("user_id") @db.Uuid
+  organizationId String?          @map("organization_id") @db.Uuid
+  actorId        String?          @map("actor_id") @db.Uuid
+  type           NotificationType
+  title          String           @db.VarChar(200)
+  body           String?          @db.VarChar(500)
+  /// Link target: { type: "task" | "project" | "organization", id, projectId? }.
+  resource       Json?
+  readAt         DateTime?        @map("read_at") @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user         User          @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  actor        User?         @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, readAt])
+  @@index([readAt, createdAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+model Report {
+  id             String       @id @default(uuid(7)) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  requestedById  String?      @map("requested_by_id") @db.Uuid
+  type           ReportType
+  status         ReportStatus @default(PENDING)
+  params         Json         @default("{}")
+  storageKey     String?      @map("storage_key") @db.VarChar(512)
+  fileName       String?      @map("file_name") @db.VarChar(255)
+  error          String?      @db.VarChar(500)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  completedAt    DateTime?    @map("completed_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requestedBy  User?        @relation(fields: [requestedById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@map("reports")
+}

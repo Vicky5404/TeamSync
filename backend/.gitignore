@@ -1,0 +1,26 @@
+# Dependencies & build output
+node_modules
+dist
+coverage
+*.tsbuildinfo
+
+# Generated Prisma client (run `npm run prisma:generate`)
+src/generated
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Local env files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.sw?

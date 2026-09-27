@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "flowsync",
+      "credentials": [{ "accessKey": "flowsync", "secretKey": "flowsync-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

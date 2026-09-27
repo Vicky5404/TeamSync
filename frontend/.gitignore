@@ -1,0 +1,23 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dependencies & build output
+node_modules
+dist
+dist-ssr
+coverage
+*.tsbuildinfo
+
+# Local env files (never commit secrets)
+.env.local
+.env.*.local
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.sw?

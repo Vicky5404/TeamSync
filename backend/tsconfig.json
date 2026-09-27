@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolvePackageJsonExports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* NestJS dependency injection relies on legacy decorators + metadata */
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    /* Emit (used by tsconfig.build.json) */
+    "outDir": "./dist",
+    "sourceMap": true,
+    "removeComments": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo",
+
+    /* Strictness (mirrors the web client) */
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src", "test", "prisma", "*.config.ts"]
+}
